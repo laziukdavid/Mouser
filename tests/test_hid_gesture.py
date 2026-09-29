@@ -1324,5 +1324,287 @@ class HidReconnectStormTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 0.5)
 
 
+def _long_reply(dev_idx, feat, func, params=()):
+    buf = [
+        hid_gesture.LONG_ID, dev_idx, feat,
+        ((func & 0x0F) << 4) | hid_gesture.MY_SW,
+    ] + list(params)
+    return buf + [0] * (20 - len(buf))
+
+
+def _rx_script(*reports):
+    """_rx stand-in: returns ``reports`` in order, then None forever."""
+    pending = list(reports)
+
+    def fake_rx(_timeout_ms=0):
+        return pending.pop(0) if pending else None
+
+    return fake_rx
+
+
+class KvmReconnectTests(unittest.TestCase):
+    """Fast reconnect when a KVM moves the receiver away and back."""
+
+    RECEIVER = {
+        "product_id": 0xC548,
+        "usage_page": 0xFF00,
+        "usage": 0x0001,
+        "source": "hidapi-enumerate",
+        "product_string": "USB Receiver",
+        "path": b"DevSrvsID:100",
+    }
+
+    @contextlib.contextmanager
+    def _connecting(self, listener, infos, fake_dev, *, find_feature,
+                    controls=None, divert=True, cache=None):
+        cms = (
+            patch.object(hid_gesture, "HIDAPI_OK", True),
+            patch.object(hid_gesture, "_BACKEND_PREFERENCE", "hidapi"),
+            patch.object(hid_gesture, "_HID_API_STYLE", "hidapi"),
+            patch.object(
+                hid_gesture,
+                "_hid",
+                SimpleNamespace(device=lambda: fake_dev),
+                create=True,
+            ),
+            patch.object(hid_gesture, "_load_last_device_cache", return_value=cache),
+            patch.object(hid_gesture, "_save_last_device_cache"),
+            patch.object(listener, "_vendor_hid_infos", return_value=infos),
+            patch.object(listener, "_find_feature", side_effect=find_feature),
+            patch.object(
+                listener,
+                "_discover_reprog_controls",
+                side_effect=controls or (lambda: []),
+            ),
+            patch.object(listener, "_divert", return_value=divert),
+            patch.object(listener, "_divert_extras"),
+            patch("builtins.print"),
+        )
+        with contextlib.ExitStack() as stack:
+            for cm in cms:
+                stack.enter_context(cm)
+            yield
+
+    # ── reply matching / timeouts ──────────────────────────────────
+
+    def test_request_ignores_late_reply_from_another_slot(self):
+        # The slot-2 mouse answers the previous probe late, while slot 1 is
+        # being probed; that must not count as slot 1 having REPROG_V4.
+        listener = hid_gesture.HidGestureListener()
+        listener._dev_idx = 1
+        late = _long_reply(2, 0x00, 0, [0x0D])
+        with (
+            patch.object(listener, "_tx"),
+            patch.object(listener, "_rx", side_effect=_rx_script(late)),
+        ):
+            self.assertIsNone(listener._request(0x00, 0, [0x1B, 0x04, 0x00],
+                                                timeout_ms=50))
+
+    def test_request_accepts_reply_from_own_slot(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._dev_idx = 2
+        own = _long_reply(2, 0x00, 0, [0x0D])
+        with (
+            patch.object(listener, "_tx"),
+            patch.object(listener, "_rx", side_effect=_rx_script(own)),
+        ):
+            msg = listener._request(0x00, 0, [0x1B, 0x04, 0x00], timeout_ms=50)
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg[4][0], 0x0D)
+
+    def test_request_accepts_bluetooth_reply_on_index_zero(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._dev_idx = hid_gesture.BT_DEV_IDX
+        reply = _long_reply(0x00, 0x00, 0, [0x0D])
+        with (
+            patch.object(listener, "_tx"),
+            patch.object(listener, "_rx", side_effect=_rx_script(reply)),
+        ):
+            self.assertIsNotNone(
+                listener._request(0x00, 0, [0x1B, 0x04, 0x00], timeout_ms=50)
+            )
+
+    def test_request_uses_short_default_timeout_while_discovering(self):
+        listener = hid_gesture.HidGestureListener()
+        with (
+            patch.object(hid_gesture, "DISCOVERY_REQUEST_TIMEOUT_MS", 30),
+            patch.object(listener, "_tx"),
+            patch.object(listener, "_rx", return_value=None),
+        ):
+            start = time.monotonic()
+            self.assertIsNone(listener._request(0x0E, 0, []))
+        self.assertLess(time.monotonic() - start, 0.4)
+
+    # ── connect-pass pruning ───────────────────────────────────────
+
+    def test_slot_with_unreadable_control_table_is_skipped(self):
+        listener = hid_gesture.HidGestureListener()
+        fake_dev = _FakeHidDevice()
+        controls = iter([None, []])
+        divert = Mock(return_value=True)
+        with self._connecting(
+            listener, [dict(self.RECEIVER)], fake_dev,
+            find_feature=lambda feature_id, *, timeout_ms=None: (
+                0x0D if feature_id == hid_gesture.FEAT_REPROG_V4 else None
+            ),
+            controls=lambda: next(controls),
+        ), patch.object(listener, "_divert", divert):
+            self.assertTrue(listener._try_connect())
+        # Slot 1 went quiet after the root probe: no divert was tried there.
+        divert.assert_called_once_with()
+        self.assertEqual(listener._dev_idx, 2)
+
+    def test_non_receiver_pid_is_dropped_after_two_silent_slots(self):
+        listener = hid_gesture.HidGestureListener()
+        fake_dev = _FakeHidDevice()
+        webcam = [
+            {"product_id": 0x0944, "usage_page": up, "usage": 1,
+             "source": "hidapi-enumerate", "product_string": "MX Brio",
+             "path": f"webcam-col-{up:04X}".encode()}
+            for up in (0xFF00, 0xFF01, 0xFF02)
+        ]
+        find_feature = Mock(return_value=None)
+        with self._connecting(listener, webcam, fake_dev,
+                              find_feature=find_feature):
+            self.assertFalse(listener._try_connect())
+        self.assertEqual(find_feature.call_count, 2)
+        fake_dev.open_path.assert_called_once()
+        for info in webcam:
+            self.assertIn(
+                hid_gesture._candidate_cooldown_key(info),
+                listener._reprog_absent_until,
+            )
+
+    def test_same_channel_listed_twice_is_probed_once(self):
+        listener = hid_gesture.HidGestureListener()
+        fake_dev = _FakeHidDevice()
+        short = dict(self.RECEIVER)
+        long_ = dict(self.RECEIVER, usage=0x0002)
+        with self._connecting(listener, [short, long_], fake_dev,
+                              find_feature=Mock(return_value=None)):
+            self.assertFalse(listener._try_connect())
+        fake_dev.open_path.assert_called_once_with(b"DevSrvsID:100")
+
+    def test_iokit_channel_matches_hidapi_path(self):
+        self.assertEqual(
+            hid_gesture.HidGestureListener._candidate_channel_keys(
+                {"path": b"DevSrvsID:42"}
+            ),
+            hid_gesture.HidGestureListener._candidate_channel_keys(
+                {"channel": "DevSrvsID:42", "source": "iokit-enumerate"}
+            ),
+        )
+
+    def test_cached_interface_gets_warm_timeout_and_no_cooldown(self):
+        listener = hid_gesture.HidGestureListener()
+        fake_dev = _FakeHidDevice()
+        cache = {
+            "candidate": hid_gesture._candidate_signature(self.RECEIVER),
+            "device": {"dev_idx": 2, "name": "MX Master 4"},
+        }
+        probes = []
+
+        def find_feature(feature_id, *, timeout_ms=None):
+            probes.append((listener._dev_idx, timeout_ms))
+            return None
+
+        with self._connecting(listener, [dict(self.RECEIVER)], fake_dev,
+                              find_feature=find_feature, cache=cache):
+            self.assertFalse(listener._try_connect())
+        self.assertEqual(probes[0], (2, hid_gesture.WARM_PROBE_TIMEOUT_MS))
+        self.assertTrue(all(
+            timeout == hid_gesture.PROBE_TIMEOUT_MS for _, timeout in probes[1:]
+        ))
+        self.assertEqual(listener._reprog_absent_until, {})
+
+    # ── arrival detection ──────────────────────────────────────────
+
+    def _presence(self, listener, *snapshots):
+        seq = list(snapshots)
+
+        def snapshot():
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        return patch.object(listener, "_presence_snapshot", side_effect=snapshot)
+
+    def test_wait_for_arrival_returns_true_when_interface_appears(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._running = True
+        listener._presence_baseline = frozenset({"a"})
+        with (
+            self._presence(listener, frozenset({"a"}), frozenset({"a", "b"})),
+            patch.object(listener, "_interruptible_sleep"),
+        ):
+            self.assertTrue(listener._wait_for_arrival(30))
+
+    def test_wait_for_arrival_counts_departure_then_return(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._running = True
+        listener._presence_baseline = frozenset({"a"})
+        with (
+            self._presence(listener, frozenset(), frozenset({"a"})),
+            patch.object(listener, "_interruptible_sleep"),
+        ):
+            self.assertTrue(listener._wait_for_arrival(30))
+
+    def test_wait_for_arrival_times_out_without_changes(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._running = True
+        listener._presence_baseline = frozenset({"a"})
+        with self._presence(listener, frozenset({"a"})):
+            self.assertFalse(listener._wait_for_arrival(0.2))
+
+    def test_no_baseline_means_plain_sleep(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._running = True
+        snapshot = Mock()
+        with patch.object(listener, "_presence_snapshot", snapshot):
+            self.assertFalse(listener._wait_for_arrival(0))
+        snapshot.assert_not_called()
+
+    def test_main_loop_retries_at_once_on_arrival_with_cooldowns_cleared(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._running = True
+        attempts = []
+
+        def fake_try_connect():
+            attempts.append(
+                (time.monotonic(), dict(listener._reprog_absent_until))
+            )
+            listener._reprog_absent_until["webcam"] = time.monotonic() + 999
+            if len(attempts) == 2:
+                listener._running = False
+            return False
+
+        with (
+            self._presence(listener, frozenset({"g915"}),
+                           frozenset({"g915", "bolt"})),
+            patch.object(listener, "_try_connect", side_effect=fake_try_connect),
+            patch("builtins.print"),
+        ):
+            listener._main_loop()
+
+        self.assertEqual(len(attempts), 2)
+        # Retried well inside the 1.5 s base backoff, with a clean slate.
+        self.assertLess(attempts[1][0] - attempts[0][0], 1.0)
+        self.assertEqual(attempts[1][1], {})
+
+
+@unittest.skipUnless(
+    sys.platform == "darwin" and hid_gesture._MAC_NATIVE_OK,
+    "macOS IOKit backend only",
+)
+class MacNativeRemovalTests(unittest.TestCase):
+    def test_removed_device_drains_queue_then_raises(self):
+        dev = hid_gesture._MacNativeHidDevice(0xC548)
+        dev._report_queue.put_nowait(b"queued")
+        dev._on_removed(None, 0, None)
+        self.assertEqual(dev.read(64, 10), b"queued")
+        with self.assertRaises(OSError):
+            dev.read(64, 10)
+        with self.assertRaises(OSError):
+            dev.write([hid_gesture.LONG_ID] + [0] * 19)
+
+
 if __name__ == "__main__":
     unittest.main()
